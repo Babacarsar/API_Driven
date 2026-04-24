@@ -58,26 +58,235 @@ Votre mission (si vous l'acceptez) : Concevoir une architecture **API-driven** d
 ![Screenshot Actions](API_Driven.png)   
   
 ---------------------------------------------------  
-## Processus de travail (résumé)
+# API Driven Infrastructure — LocalStack (EC2 + Lambda + API Gateway)
 
-1. Installation de l'environnement Localstack (Séquence 2)
-2. Création de l'instance EC2
-3. Création des API (+ fonction Lambda)
-4. Ouverture des ports et vérification du fonctionnement
+## 1. Objectif
 
----------------------------------------------------
-Séquence 4 : Documentation  
-Difficulté : Facile (~30 minutes)
----------------------------------------------------
-**Complétez et documentez ce fichier README.md** pour nous expliquer comment utiliser votre solution.  
-Faites preuve de pédagogie et soyez clair dans vos expliquations et processus de travail.  
-   
----------------------------------------------------
-Evaluation
----------------------------------------------------
-Cet atelier, **noté sur 20 points**, est évalué sur la base du barème suivant :  
-- Repository exécutable sans erreur majeure (4 points)
-- Fonctionnement conforme au scénario annoncé (4 points)
-- Degré d'automatisation du projet (utilisation de Makefile ? script ? ...) (4 points)
-- Qualité du Readme (lisibilité, erreur, ...) (4 points)
-- Processus travail (quantité de commits, cohérence globale, interventions externes, ...) (4 points) 
+Ce projet met en place une architecture inspirée d’AWS en local grâce à **LocalStack**.
+
+L’objectif est de :
+
+- Simuler une instance EC2
+- Créer une fonction Lambda pour piloter cette instance
+- Exposer cette fonction via une API Gateway
+- Interagir avec l’infrastructure via HTTP (API)
+
+---
+
+## 2. Architecture
+
+Utilisateur → API Gateway → Lambda → EC2 (LocalStack)
+
+- API Gateway : point d’entrée HTTP
+- Lambda : logique métier (start / stop / describe)
+- EC2 : ressource simulée
+
+---
+
+## 3. Prérequis
+
+Installer :
+
+```bash
+sudo apt update
+sudo apt install -y curl unzip zip python3-pip
+
+Installer AWS CLI :
+
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+unzip -o /tmp/awscliv2.zip -d /tmp
+sudo /tmp/aws/install
+
+Installer LocalStack :
+
+pip install localstack awscli-local
+4. Lancer LocalStack
+localstack start -d
+
+Vérifier :
+
+docker ps
+5. Configuration AWS (fake)
+aws configure
+
+Mettre :
+
+Access key: test
+Secret key: test
+Region: us-east-1
+6. Création de l’instance EC2
+
+Lister les images disponibles :
+
+awslocal ec2 describe-images
+
+Créer une instance :
+
+awslocal ec2 run-instances \
+  --image-id ami-03cf127a \
+  --count 1 \
+  --instance-type t2.micro
+
+Récupérer son ID :
+
+INSTANCE_ID=$(awslocal ec2 describe-instances \
+  --query "Reservations[0].Instances[0].InstanceId" \
+  --output text)
+
+echo $INSTANCE_ID
+7. Création de la Lambda
+
+Créer le fichier :
+
+mkdir lambda
+nano lambda/lambda_function.py
+
+Code :
+
+import json
+import boto3
+
+def handler(event, context):
+    ec2 = boto3.client(
+        "ec2",
+        endpoint_url="http://host.docker.internal:4566",
+        region_name="us-east-1",
+        aws_access_key_id="test",
+        aws_secret_access_key="test"
+    )
+
+    body = event.get("body", event)
+
+    if isinstance(body, str):
+        body = json.loads(body)
+
+    action = body.get("action", "describe")
+    instance_id = body.get("instance_id")
+
+    if action == "describe":
+        return {
+            "statusCode": 200,
+            "body": json.dumps(ec2.describe_instances(), default=str)
+        }
+
+    if action == "start":
+        ec2.start_instances(InstanceIds=[instance_id])
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"status": "started"})
+        }
+
+    if action == "stop":
+        ec2.stop_instances(InstanceIds=[instance_id])
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"status": "stopped"})
+        }
+
+    return {
+        "statusCode": 400,
+        "body": json.dumps({"error": "invalid action"})
+    }
+
+Zip :
+
+cd lambda
+zip function.zip lambda_function.py
+cd ..
+
+Créer la Lambda :
+
+awslocal lambda create-function \
+  --function-name ec2-control \
+  --runtime python3.11 \
+  --handler lambda_function.handler \
+  --zip-file fileb://lambda/function.zip \
+  --role arn:aws:iam::000000000000:role/lambda-role
+
+Test Lambda :
+
+awslocal lambda invoke \
+  --function-name ec2-control \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"action":"describe"}' \
+  response.json
+
+cat response.json
+8. Création API Gateway
+
+Créer API :
+
+awslocal apigateway create-rest-api --name "ec2-api"
+
+Récupérer ID :
+
+API_ID=$(awslocal apigateway get-rest-apis --query "items[0].id" --output text)
+
+Root :
+
+ROOT_ID=$(awslocal apigateway get-resources \
+  --rest-api-id $API_ID \
+  --query "items[0].id" \
+  --output text)
+
+Créer route :
+
+RESOURCE_ID=$(awslocal apigateway create-resource \
+  --rest-api-id $API_ID \
+  --parent-id $ROOT_ID \
+  --path-part control \
+  --query "id" \
+  --output text)
+
+Méthode POST :
+
+awslocal apigateway put-method \
+  --rest-api-id $API_ID \
+  --resource-id $RESOURCE_ID \
+  --http-method POST \
+  --authorization-type NONE
+
+Intégration Lambda :
+
+awslocal apigateway put-integration \
+  --rest-api-id $API_ID \
+  --resource-id $RESOURCE_ID \
+  --http-method POST \
+  --type AWS_PROXY \
+  --integration-http-method POST \
+  --uri arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:000000000000:function:ec2-control/invocations
+
+Déployer :
+
+awslocal apigateway create-deployment \
+  --rest-api-id $API_ID \
+  --stage-name dev
+9. Tests
+
+Lister EC2 via API :
+
+curl -X POST "http://localhost:4566/restapis/$API_ID/dev/_user_request_/control" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"describe"}'
+
+Stop instance :
+
+curl -X POST "http://localhost:4566/restapis/$API_ID/dev/_user_request_/control" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"stop\",\"instance_id\":\"$INSTANCE_ID\"}"
+
+Start instance :
+
+curl -X POST "http://localhost:4566/restapis/$API_ID/dev/_user_request_/control" \
+  -H "Content-Type: application/json" \
+  -d "{\"action\":\"start\",\"instance_id\":\"$INSTANCE_ID\"}"
+
+Vérification :
+
+awslocal ec2 describe-instances \
+  --query "Reservations[0].Instances[0].State.Name" \
+  --output text
+
+Résultat :
+
+running
